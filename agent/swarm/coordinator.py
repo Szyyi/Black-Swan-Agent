@@ -7,7 +7,6 @@ Fixes:
 - Agents are NOT killed/restarted on refresh
 - Status prints every 20 seconds
 - Protection against overlapping refreshes
-- Clear "alive" messages so you know it's working
 """
 
 from __future__ import annotations
