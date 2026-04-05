@@ -1,0 +1,68 @@
+# Black Swan Agent — Configuration
+# Copy this file to config.yaml and fill in your API keys
+# NEVER commit config.yaml to git
+
+mode: paper  # 'paper' for simulation, 'live' for real trading
+platform: smarkets
+
+# Smarkets Exchange (https://smarkets.com)
+smarkets:
+  username: "your_email@example.com"
+  password: "your_password"
+  api_url: "https://api.smarkets.com/v3"
+  stream_host: "stream.smarkets.com"
+  stream_port: 3801
+  domains:
+    - "politics"
+    - "current_affairs"
+    - "entertainment"
+    - "football"
+    - "horse_racing"
+    - "tennis"
+
+# Anthropic Claude API (https://console.anthropic.com)
+anthropic:
+  api_key: "sk-ant-your-key-here"
+  model: "claude-sonnet-4-20250514"
+
+# Trading Strategies
+strategies:
+  arbitrage:
+    enabled: true
+    weight: 0.25
+  sentiment:
+    enabled: true
+    weight: 0.25
+    news_sources:
+      - "reuters_rss"
+  market_making:
+    enabled: true
+    weight: 0.25
+  event_probability:
+    enabled: true
+    weight: 0.25
+    ensemble_models: 3
+
+# Risk Management
+risk:
+  max_total_exposure_usd: 5000
+  max_single_market_pct: 15
+  max_daily_loss_usd: 500
+  max_drawdown_pct: 10
+  correlation_limit: 0.7
+  kill_switch_loss_usd: 1000
+  cooldown_after_loss_sec: 3600
+
+# External Data APIs (free tiers)
+data_apis:
+  football_data_key: ""   # Free at https://www.football-data.org/client/register
+  odds_api_key: ""        # Free at https://the-odds-api.com
+
+# Storage
+storage:
+  db_path: "./data/trades.db"
+
+# Monitoring
+monitoring:
+  log_level: "INFO"
+  metrics_port: 9090
