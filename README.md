@@ -127,7 +127,7 @@ Tracks how consensus evolves over time per market. Detects:
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/black-swan-agent.git
+git clone https://github.com/Szyyi/black-swan-agent.git
 cd black-swan-agent
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
