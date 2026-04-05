@@ -1,5 +1,6 @@
 <p align="center">
-  <h1 align="center">🦢 Black Swan Agent</h1>
+  <h1 align="center">Black Swan Agent</h1>
+  <img width="1920" height="1080" alt="Untitled design (1)" src="https://github.com/user-attachments/assets/dfaf8644-c8f7-4e5c-87a9-47c789df58ca" />
   <p align="center"><strong>Multi-Agent AI Trading Swarm for Prediction Markets</strong></p>
   <p align="center">
     11 specialised AI agents · Bayesian belief engine · Cross-bookmaker arbitrage · Real-time sports intelligence
