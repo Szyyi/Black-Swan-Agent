@@ -33,6 +33,13 @@ from agent.swarm.world_model import (
     Belief, Correlation, NewsImpact, TimingSignal, WorldModel,
 )
 
+_attention_engine = None  # Set by coordinator after init
+
+def set_attention_engine(engine):
+    """Called by coordinator to share the attention engine with agents."""
+    global _attention_engine
+    _attention_engine = engine
+
 logger = structlog.get_logger()
 
 
@@ -493,7 +500,12 @@ Step 4: Factor in that unlikely events become less likely as time runs out.""",
             scored_markets.append((score, m))
 
         scored_markets.sort(key=lambda x: x[0], reverse=True)
-        batch = [m for _, m in scored_markets[:3]]
+        # Use attention engine if available, else fall back to scored list
+        attention_batch = get_priority_markets(self.name, markets, top_n=3)
+        if attention_batch and _attention_engine is not None:
+            batch = attention_batch
+        else:
+            batch = [m for _, m in scored_markets[:3]]
 
         for market in batch:
             await self._estimate_market(market)
@@ -784,8 +796,7 @@ class ContrarianAgent(SwarmAgent):
 
     async def run_cycle(self, markets: list[Market]):
         candidates = [m for m in markets if m.active]
-        candidates.sort(key=lambda m: m.volume, reverse=True)
-        batch = candidates[:20]
+        batch = get_priority_markets(self.name, candidates, top_n=20)
 
         if not batch:
             return
@@ -1173,8 +1184,13 @@ class SportsIntelligenceAgent(SwarmAgent):
         if not sports_markets:
             return
 
+        # Attention-prioritised sports markets
+        priority_sports = get_priority_markets(
+            self.name, sports_markets, top_n=6, category_filter=None
+        )
+
         analysed = 0
-        for market in sports_markets[:6]:
+        for market in priority_sports:
             try:
                 await self._analyse_sports_market(market)
                 analysed += 1
@@ -1468,12 +1484,13 @@ class WebResearchAgent(SwarmAgent):
 
         if not to_research:
             # Research highest-volume markets we haven't looked at
+            # Use attention engine to find markets worth researching
             unresearched = [
                 m for m in markets
                 if m.active and m.condition_id not in self._researched
             ]
-            unresearched.sort(key=lambda m: m.volume, reverse=True)
-            to_research = [m.condition_id for m in unresearched[:3]]
+            priority = get_priority_markets(self.name, unresearched, top_n=3)
+            to_research = [m.condition_id for m in priority]
 
         researched_count = 0
         for mid in to_research[:3]:
@@ -1582,3 +1599,30 @@ End with JSON on its own line:
             edge=round((prob - price) * 100, 1),
             insight=result.get("key_insight", "")[:60],
         )
+
+
+# ══════════════════════════════════════════════════════
+#  ATTENTION-AWARE MARKET SELECTION HELPER
+# ══════════════════════════════════════════════════════
+
+def get_priority_markets(agent_name: str, markets: list,
+                         top_n: int = 5, category_filter: str | None = None) -> list:
+    """
+    Get attention-prioritised markets for an agent.
+    Falls back to volume-based sorting if no attention engine is set.
+    
+    Used by agents instead of their own ad-hoc sorting logic.
+    """
+    if _attention_engine is not None:
+        result = _attention_engine.get_priority_markets(
+            agent_name, markets, top_n=top_n, category_filter=category_filter,
+        )
+        if result:
+            return result
+
+    # Fallback: sort by volume (original behaviour)
+    active = [m for m in markets if m.active]
+    active.sort(key=lambda m: m.volume, reverse=True)
+    if category_filter:
+        active = [m for m in active if m.category == category_filter]
+    return active[:top_n]

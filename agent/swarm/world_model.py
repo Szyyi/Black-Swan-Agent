@@ -10,6 +10,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from statistics import mean, stdev
 from threading import RLock
+ 
+from agent.swarm.decay import DecayEngine
 
 import structlog
 
@@ -202,6 +204,14 @@ class WorldModel:
         self._conviction: dict[str, float] = {}
         self._agent_last_active: dict[str, float] = {}
         self._conflicts: list[dict] = []
+        self.decay_engine = DecayEngine()
+        self._event_callbacks: dict[str, list] = defaultdict(list)
+
+    
+    def register_event_callback(self, event_type: str, callback):
+        """Register callback for event types: 'price_update', 'news_impact', 'surprise', 'belief_update'"""
+        self._event_callbacks[event_type].append(callback)
+
 
     def submit_belief(self, belief: Belief):
         with self._lock:
@@ -229,6 +239,13 @@ class WorldModel:
                     self._surprises.append(SurpriseEvent(market_id=belief.market_id, old_consensus=old_consensus, new_belief=belief.probability, shift_magnitude=shift, agent=belief.agent_name, reasoning=belief.reasoning))
                     self._surprises = self._surprises[-50:]
                     print(f"    *** SURPRISE: shifted consensus by {shift:.0%} ***", flush=True)
+                    # Fire surprise event callbacks
+                    for cb in self._event_callbacks.get("surprise", []):
+                        try:
+                            cb(belief.market_id, old_consensus, belief.probability,
+                               belief.agent_name, market_q)
+                        except Exception:
+                            pass
 
             new_consensus, new_conf, contributors = self._get_consensus_unlocked(belief.market_id)
             if new_consensus is not None:
@@ -306,8 +323,11 @@ class WorldModel:
         agents = []
         for b in beliefs:
             age = now - b.timestamp
-            half_life = b.ttl_seconds / 2
-            freshness = math.exp(-0.693 * age / half_life) if half_life > 0 else 0
+            regime = self._regimes.get(market_id)
+            regime_str = regime.regime if regime else "unknown"
+            freshness = self.decay_engine.compute_freshness(
+                b.agent_name, age, regime_str
+            )
             trust = self.trust.get_trust_weight(b.agent_name, domain)
             weight = b.confidence * trust * freshness
             if weight > 0.01:
@@ -331,7 +351,14 @@ class WorldModel:
 
     def _get_valid_beliefs(self, market_id):
         now = time.time()
-        return [b for b in self._beliefs.get(market_id, []) if now - b.timestamp < b.ttl_seconds]
+        regime = self._regimes.get(market_id)
+        regime_str = regime.regime if regime else "unknown"
+        valid = []
+        for b in self._beliefs.get(market_id, []):
+            age = now - b.timestamp
+            if self.decay_engine.is_belief_alive(b.agent_name, age, regime_str):
+                valid.append(b)
+        return valid
 
     def _record_conflict(self, market_id, beliefs, disagreement):
         self._conflicts = [c for c in self._conflicts if c.get("market_id") != market_id]
@@ -531,6 +558,11 @@ class WorldModel:
         with self._lock:
             self._news_impacts.append(impact)
             self._news_impacts = self._news_impacts[-100:]
+            for cb in self._event_callbacks.get("news_impact", []):
+                try:
+                    cb(impact)
+                except Exception:
+                    pass
 
     def get_recent_news(self, max_age_sec=3600):
         cutoff = time.time() - max_age_sec
@@ -544,7 +576,11 @@ class WorldModel:
     def submit_timing_signal(self, signal):
         with self._lock:
             self._timing_signals.append(signal)
-
+            for cb in self._event_callbacks.get("timing_signal", []):
+                try:
+                    cb(signal)
+                except Exception:
+                    pass
     def get_timing_signals(self, market_id):
         now = time.time()
         with self._lock:
@@ -563,6 +599,11 @@ class WorldModel:
             cutoff = time.time() - 7200
             self._price_history[market_id] = [(ts, p) for ts, p in self._price_history[market_id] if ts > cutoff]
         self.update_regime(market_id)
+        for cb in self._event_callbacks.get("price_update", []):
+            try:
+                cb(market_id, price, question=question)
+            except Exception:
+                pass
 
     def get_market_price(self, market_id):
         with self._lock:

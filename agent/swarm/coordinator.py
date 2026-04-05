@@ -40,6 +40,14 @@ from agent.swarm.agents import (
     WebResearchAgent,
 )
 from agent.swarm.world_model import WorldModel
+from agent.swarm.adversarial import AdversarialAgent
+from agent.swarm.attention import AttentionAllocationEngine
+from agent.swarm.event_bus import (
+    EventBus, create_price_spike_detector,
+    create_news_detector, create_surprise_detector,
+)
+from agent.swarm.metalearning import MetalearningSystem, TradeOutcome
+from agent.swarm.thesis import ThesisGenerator
 
 logger = structlog.get_logger()
 
@@ -134,6 +142,41 @@ class MetaCoordinator:
         self.executor = ExecutionEngine(config)
         self.performance = PerformanceTracker()
         self.agents: list[SwarmAgent] = self._create_agents()
+        self.event_bus = EventBus(cooldown_seconds=30)
+        self.attention = AttentionAllocationEngine(self.world)
+        from agent.swarm import agents as agents_module
+        agents_module.set_attention_engine(self.attention)
+        self.metalearning = MetalearningSystem(
+            persist_path="./data/metalearning.json"
+        )
+        self.thesis_gen = ThesisGenerator(self.world)
+
+        # Give thesis generator access to adversarial agent
+        adversarial = next(
+            (a for a in self.agents if getattr(a, 'name', '') == 'adversarial'),
+            None
+        )
+        if adversarial:
+            self.thesis_gen = ThesisGenerator(self.world, adversarial)
+        
+        # Wire up event-driven triggers
+        self.world.register_event_callback(
+            "price_update",
+            create_price_spike_detector(self.event_bus, threshold_pct=5.0)
+        )
+        self.world.register_event_callback(
+            "news_impact",
+            create_news_detector(self.event_bus, urgency_threshold=0.7)
+        )
+        self.world.register_event_callback(
+            "surprise",
+            create_surprise_detector(self.event_bus, shift_threshold=0.10)
+        )
+
+        # Register all agents with event bus
+        for agent in self.agents:
+            self.event_bus.register_agent(agent.name, agent)
+
 
         self._markets: list[Market] = []
         self._last_market_refresh: float = 0
@@ -181,6 +224,10 @@ class MetaCoordinator:
         if odds_key:
             agents.append(OddsArbitrageAgent(self.world, odds_api_key=odds_key))
         out(f"  [INIT] {len(agents)} agents created")
+        if cfg.anthropic_api_key:
+            agents.append(AdversarialAgent(
+                self.world, cfg.anthropic_api_key, cfg.anthropic_model,
+            ))
         return agents
 
     # ── Main Loop ──────────────────────────────────────
@@ -284,11 +331,37 @@ class MetaCoordinator:
                 if other_id in self.risk.positions:
                     corr_penalty += corr.strength * 0.3
 
+            # Metalearning weight: boost proven combos, dampen bad ones
+            meta_weight = self.metalearning.get_combo_weight(
+                agents=edge.contributing_agents,
+                category=self.world._market_categories.get(edge.market_id, ""),
+                regime=edge.regime,
+                hour=time.localtime().tm_hour,
+            )
+
+            # Adversarial gate: reduce score if risk is high
+            adversarial_ref = next(
+                (a for a in self.agents if getattr(a, 'name', '') == 'adversarial'),
+                None
+            )
+            adversarial_mult = 1.0
+            if adversarial_ref:
+                risk = adversarial_ref.get_risk_rating(edge.market_id)
+                if risk == "dangerous":
+                    adversarial_mult = 0.4
+                elif risk == "abort":
+                    adversarial_mult = 0.0  # Block the trade entirely
+                elif risk == "proceed_with_caution":
+                    adversarial_mult = 0.7
+
             composite = (
                 edge.edge_pct * edge.confidence * urgency * freshness
                 * agreement_bonus * (1 - corr_penalty)
                 * self.performance.confidence_multiplier
+                * meta_weight
+                * adversarial_mult
             )
+
             if composite < 1.5:
                 continue
 
@@ -335,10 +408,36 @@ class MetaCoordinator:
                 self.performance.record_trade(
                     estimated_pnl, edge.contributing_agents, edge.market_question
                 )
-                out(
-                    f"  [TRADE] {edge.direction} {edge.market_question[:40]} "
-                    f"| edge={edge.edge_pct:.1f}% | ${sized:.2f} | score={composite:.1f}"
+
+                # === Generate trade thesis ===
+                kelly_frac = self._kelly_size(edge, urgency)
+                thesis = self.thesis_gen.generate(
+                    edge=edge,
+                    composite_score=composite,
+                    size_usd=sized,
+                    kelly_fraction=kelly_frac / sized if sized > 0 else 0,
+                    confidence_multiplier=self.performance.confidence_multiplier,
+                    trade_id=result.exchange_order_id or order.id,
                 )
+
+                # Terminal output with thesis
+                out(thesis.to_terminal_summary())
+
+                # === Record for metalearning ===
+                import datetime
+                self.metalearning.record_outcome(TradeOutcome(
+                    market_id=edge.market_id,
+                    market_question=edge.market_question,
+                    market_category=self.world._market_categories.get(edge.market_id, ""),
+                    contributing_agents=edge.contributing_agents,
+                    edge_pct=edge.edge_pct,
+                    conviction=edge.conviction,
+                    composite_score=composite,
+                    regime=edge.regime,
+                    hour_of_day=datetime.datetime.now().hour,
+                    pnl=estimated_pnl,
+                    was_profitable=estimated_pnl > 0,
+                ))
 
     def _kelly_size(self, edge, urgency: float) -> float:
         win_prob = edge.fair_value
@@ -427,12 +526,30 @@ class MetaCoordinator:
             if s["errors"] > 0:
                 out(f"    {s['name']}: {s['errors']} errors, {s['runs']} runs")
 
+        # Event bus status
+        bus_status = self.event_bus.get_status()
+        if bus_status["recent_events_5min"] > 0:
+            out(f"  Events (5min): {bus_status['recent_events_5min']} | "
+                f"Types: {bus_status['event_types']}")
+
+        # Attention highlights
+        attn = self.attention.get_attention_report()
+        if attn["top_attention_markets"]:
+            top = attn["top_attention_markets"][0]
+            out(f"  Top attention: '{top['question']}' (score: {top['total_score']:.1f})")
+
+
         out("")
 
     def get_status(self) -> dict:
         portfolio = self.risk.get_snapshot()
         return {
             "running": self.running,
+            "event_bus": self.event_bus.get_status(),
+            "attention": self.attention.get_attention_report(),
+            "metalearning": self.metalearning.get_report(),
+            "recent_theses": self.thesis_gen.get_recent_theses(5),
+            "decay_profiles": self.world.decay_engine.get_status(),
             "mode": self.config.mode,
             "platform": self.config.platform,
             "performance": self.performance.get_summary(),
