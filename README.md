@@ -269,7 +269,7 @@ Black Swan Agent is in active development. Contributions are welcome in:
 
 ## Disclaimer
 
-This software is for educational and research purposes. Trading prediction markets involves financial risk. Paper trading mode is enabled by default. The authors accept no responsibility for financial losses incurred through use of this software. Always understand the risks before trading with real capital.
+This software is for educational and research purposes. Trading prediction markets involves financial risk. Paper trading mode is enabled by default. The author accept no responsibility for financial losses incurred through use of this software. Always understand the risks before trading with real capital.
 
 ---
 
