@@ -309,20 +309,36 @@ class AttentionAllocationEngine:
             reverse=True,
         )[:10]
 
+        items = []
+        for s in top_markets:
+            price = self.world.get_market_price(s.market_id)
+            try:
+                consensus, conf, agents = self.world.get_consensus(s.market_id)
+            except Exception:
+                consensus, conf, agents = None, 0.0, []
+            regime_obj = self.world._regimes.get(s.market_id)
+            regime_str = regime_obj.regime if regime_obj else ""
+            conviction = self.world._conviction.get(s.market_id, 0)
+
+            items.append({
+                "market_id": s.market_id,
+                "question": s.question[:60],
+                "price": price,
+                "consensus": consensus,
+                "regime": regime_str,
+                "conviction": conviction,
+                "num_agents": len(agents),
+                "total_score": round(s.total_score, 2),
+                "entropy": round(s.entropy_score, 2),
+                "surprise": round(s.surprise_score, 2),
+                "urgency": round(s.urgency_score, 2),
+                "staleness": round(s.staleness_score, 2),
+                "edge": round(s.edge_score, 2),
+                "volatility": round(s.volatility_score, 2),
+            })
+
         return {
-            "top_attention_markets": [
-                {
-                    "question": s.question[:50],
-                    "total_score": round(s.total_score, 2),
-                    "entropy": round(s.entropy_score, 2),
-                    "surprise": round(s.surprise_score, 2),
-                    "urgency": round(s.urgency_score, 2),
-                    "staleness": round(s.staleness_score, 2),
-                    "edge": round(s.edge_score, 2),
-                    "volatility": round(s.volatility_score, 2),
-                }
-                for s in top_markets
-            ],
+            "top_attention_markets": items,
             "agent_analysis_counts": {
                 agent: sum(counts.values())
                 for agent, counts in self._analysis_count.items()

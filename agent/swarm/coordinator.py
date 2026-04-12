@@ -12,6 +12,7 @@ Fixes:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import sys
 import time
 from collections import deque
@@ -47,6 +48,9 @@ from agent.swarm.event_bus import (
 )
 from agent.swarm.metalearning import MetalearningSystem, TradeOutcome
 from agent.swarm.thesis import ThesisGenerator
+from agent.backtest.recorder import SessionRecorder
+from agent.dashboard.server import run_dashboard
+
 
 logger = structlog.get_logger()
 
@@ -149,14 +153,16 @@ class MetaCoordinator:
             persist_path="./data/metalearning.json"
         )
         self.thesis_gen = ThesisGenerator(self.world)
+        self.recorder = SessionRecorder()
 
         # Give thesis generator access to adversarial agent
-        adversarial = next(
+        # Cache adversarial agent reference (used by decision cycle and thesis gen)
+        self._adversarial_ref = next(
             (a for a in self.agents if getattr(a, 'name', '') == 'adversarial'),
             None
         )
-        if adversarial:
-            self.thesis_gen = ThesisGenerator(self.world, adversarial)
+        if self._adversarial_ref:
+            self.thesis_gen = ThesisGenerator(self.world, self._adversarial_ref)
         
         # Wire up event-driven triggers
         self.world.register_event_callback(
@@ -222,11 +228,11 @@ class MetaCoordinator:
         odds_key = getattr(cfg, 'odds_api_key', '')
         if odds_key:
             agents.append(OddsArbitrageAgent(self.world, odds_api_key=odds_key))
-        out(f"  [INIT] {len(agents)} agents created")
         if cfg.anthropic_api_key:
             agents.append(AdversarialAgent(
                 self.world, cfg.anthropic_api_key, cfg.anthropic_model,
             ))
+        out(f"  [INIT] {len(agents)} agents created")
         return agents
 
     # ── Main Loop ──────────────────────────────────────
@@ -234,6 +240,7 @@ class MetaCoordinator:
     async def run(self):
         self.running = True
         await self.executor.initialize()
+        await self.recorder.start()
 
         out("")
         out("=" * 60)
@@ -253,6 +260,9 @@ class MetaCoordinator:
 
         # Start agents ONCE — don't restart them on every refresh
         agent_tasks = self._start_agents()
+
+        dashboard_task = asyncio.create_task(run_dashboard(self, port=8000))
+
 
         out("=" * 60)
         out("  SYSTEM LIVE — agents are running")
@@ -298,6 +308,7 @@ class MetaCoordinator:
                 agent.stop()
             for task in agent_tasks:
                 task.cancel()
+            dashboard_task.cancel()
             await self.shutdown()
 
     def _start_agents(self) -> list[asyncio.Task]:
@@ -339,13 +350,9 @@ class MetaCoordinator:
             )
 
             # Adversarial gate: reduce score if risk is high
-            adversarial_ref = next(
-                (a for a in self.agents if getattr(a, 'name', '') == 'adversarial'),
-                None
-            )
             adversarial_mult = 1.0
-            if adversarial_ref:
-                risk = adversarial_ref.get_risk_rating(edge.market_id)
+            if self._adversarial_ref:
+                risk = self._adversarial_ref.get_risk_rating(edge.market_id)
                 if risk == "dangerous":
                     adversarial_mult = 0.4
                 elif risk == "abort":
@@ -360,6 +367,10 @@ class MetaCoordinator:
                 * meta_weight
                 * adversarial_mult
             )
+
+            # Record every computed edge — even ones that don't trade.
+            # This is critical for measuring whether the threshold is correct.
+            self.recorder.record_edge(edge, composite_score=composite)
 
             if composite < 1.5:
                 continue
@@ -408,15 +419,27 @@ class MetaCoordinator:
                     estimated_pnl, edge.contributing_agents, edge.market_question
                 )
 
-                # === Generate trade thesis ===
-                kelly_frac = self._kelly_size(edge, urgency)
-                thesis = self.thesis_gen.generate(
-                    edge=edge,
-                    composite_score=composite,
-                    size_usd=sized,
-                    kelly_fraction=kelly_frac / sized if sized > 0 else 0,
-                    confidence_multiplier=self.performance.confidence_multiplier,
+                # Record trade for later analysis
+                adv_rating = ""
+                if self._adversarial_ref:
+                    try:
+                        adv_rating = self._adversarial_ref.get_risk_rating(edge.market_id) or ""
+                    except Exception:
+                        pass
+                self.recorder.record_trade(
                     trade_id=result.exchange_order_id or order.id,
+                    market_id=edge.market_id,
+                    market_question=edge.market_question,
+                    side=signal.side.value if hasattr(signal.side, "value") else str(signal.side),
+                    size_usd=sized,
+                    entry_price=edge.market_price,
+                    edge_pct=edge.edge_pct,
+                    composite_score=composite,
+                    contributing_agents=edge.contributing_agents,
+                    regime=edge.regime,
+                    adversarial_rating=adv_rating,
+                    kelly_fraction=self._kelly_size(edge, urgency),
+                    confidence_multiplier=self.performance.confidence_multiplier,
                 )
 
                 # Terminal output with thesis
@@ -424,6 +447,7 @@ class MetaCoordinator:
 
                 # === Record for metalearning ===
                 import datetime
+                # === Record for metalearning ===
                 self.metalearning.record_outcome(TradeOutcome(
                     market_id=edge.market_id,
                     market_question=edge.market_question,
@@ -475,16 +499,20 @@ class MetaCoordinator:
                     if price_found is not None:
                         break
 
-                # Always register every market in the world model
+                # Only register markets we have real prices for.
+                # A 0.5 placeholder poisons every belief computed against it
+                # because agents would compute fake "edges" vs a fake midpoint.
+                if price_found is None:
+                    continue
+
                 self.world.update_market_price(
                     market.condition_id,
-                    price_found if price_found is not None else 0.5,
+                    price_found,
                     question=market.question,
                     volume=market.volume,
                     category=market.category,
                 )
-                if price_found is not None:
-                    prices_loaded += 1
+                prices_loaded += 1
 
             out(f"  [DATA] {len(self._markets)} markets, {prices_loaded} with prices")
 
@@ -537,6 +565,11 @@ class MetaCoordinator:
             top = attn["top_attention_markets"][0]
             out(f"  Top attention: '{top['question']}' (score: {top['total_score']:.1f})")
 
+        # Recorder status
+        rec = self.recorder.get_status()
+        s = rec["stats"]
+        out(f"  Recorded: {s['markets']} mkts | {s['beliefs']} beliefs | "
+            f"{s['edges']} edges | {s['trades']} trades")
 
         out("")
 
@@ -566,6 +599,7 @@ class MetaCoordinator:
 
     async def shutdown(self):
         out("  [SHUTDOWN] Cleaning up...")
+        await self.recorder.stop()
         await self.executor.cancel_all()
         await self.smarkets.close()
         await self.executor.close()

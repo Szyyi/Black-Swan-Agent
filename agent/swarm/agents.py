@@ -500,15 +500,13 @@ Step 4: Factor in that unlikely events become less likely as time runs out.""",
             scored_markets.append((score, m))
 
         scored_markets.sort(key=lambda x: x[0], reverse=True)
-        # Use attention engine if available, else fall back to scored list
-        attention_batch = get_priority_markets(self.name, markets, top_n=3)
-        if attention_batch and _attention_engine is not None:
-            batch = attention_batch
-        else:
-            batch = [m for _, m in scored_markets[:3]]
-
-        for market in batch:
-            await self._estimate_market(market)
+        # Build news/signal-prioritised candidate pool, then let the attention
+        # engine rerank within it. This preserves news-impact boosting while
+        # letting UCB1 exploration pick the final batch.
+        candidates = [m for _, m in scored_markets[:15]]
+        if not candidates:
+            return
+        batch = get_priority_markets(self.name, candidates, top_n=3)
 
     async def _estimate_market(self, market: Market):
         price = self.world.get_market_price(market.condition_id)

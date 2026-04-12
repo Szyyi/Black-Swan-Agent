@@ -101,7 +101,7 @@ Examples:
     if args.swarm:
         from agent.swarm.coordinator import MetaCoordinator
         orchestrator = MetaCoordinator(config)
-        log.info("swarm_mode_enabled", agents="7 specialized agents")
+        log.info("swarm_mode_enabled", agents="12 specialized agents + adversarial + intelligence layer")
     else:
         from agent.orchestrator import Orchestrator
         orchestrator = Orchestrator(config)
@@ -121,21 +121,33 @@ Examples:
     signal.signal(signal.SIGTERM, handle_signal)
 
     # Banner
-    log.info(
-        "agent_starting",
-        mode=config.mode,
-        strategies={
-            "arbitrage": config.arbitrage.enabled,
-            "sentiment": config.sentiment.enabled,
-            "market_making": config.market_making.enabled,
-            "event_probability": config.event_probability.enabled,
-        },
-        risk_limits={
-            "max_exposure": config.risk.max_total_exposure_usd,
-            "daily_loss_limit": config.risk.max_daily_loss_usd,
-            "kill_switch": config.risk.kill_switch_loss_usd,
-        },
-    )
+    # Banner
+    if args.swarm:
+        log.info(
+            "swarm_starting",
+            mode=config.mode,
+            risk_limits={
+                "max_exposure": config.risk.max_total_exposure_usd,
+                "daily_loss_limit": config.risk.max_daily_loss_usd,
+                "kill_switch": config.risk.kill_switch_loss_usd,
+            },
+        )
+    else:
+        log.info(
+            "agent_starting",
+            mode=config.mode,
+            strategies={
+                "arbitrage": config.arbitrage.enabled,
+                "sentiment": config.sentiment.enabled,
+                "market_making": config.market_making.enabled,
+                "event_probability": config.event_probability.enabled,
+            },
+            risk_limits={
+                "max_exposure": config.risk.max_total_exposure_usd,
+                "daily_loss_limit": config.risk.max_daily_loss_usd,
+                "kill_switch": config.risk.kill_switch_loss_usd,
+            },
+        )
 
     # Run
     try:

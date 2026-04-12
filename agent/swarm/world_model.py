@@ -206,8 +206,29 @@ class WorldModel:
         self._conflicts: list[dict] = []
         self.decay_engine = DecayEngine()
         self._event_callbacks: dict[str, list] = defaultdict(list)
+        from collections import deque
+        self._thought_buffer: deque = deque(maxlen=200)
 
-    
+    def set_recorder(self, recorder):
+        """Optional: attach a SessionRecorder for passive event capture."""
+        self._recorder = recorder
+
+    def _record_belief(self, belief):
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            rec.record_belief(belief)
+
+    def _record_news(self, news):
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            rec.record_news(news)
+
+    def _record_market(self, market_id, price, volume=0, category="", question=""):
+        rec = getattr(self, "_recorder", None)
+        if rec is not None:
+            rec.record_market_snapshot(market_id, price, volume, category, question)
+
+
     def register_event_callback(self, event_type: str, callback):
         """Register callback for event types: 'price_update', 'news_impact', 'surprise', 'belief_update'"""
         self._event_callbacks[event_type].append(callback)
@@ -221,7 +242,10 @@ class WorldModel:
             self._agent_last_active[belief.agent_name] = time.time()
             domain = self._market_categories.get(belief.market_id, "general")
             self.trust.record_prediction(belief.agent_name, belief.market_id, belief.probability, domain)
+            self._record_belief(belief)
+            
 
+            # ── Narrate agent thinking ──
             # ── Narrate agent thinking ──
             market_q = self._market_questions.get(belief.market_id, belief.market_id[:8])[:45]
             price = self._market_prices.get(belief.market_id, 0.5)
@@ -232,6 +256,20 @@ class WorldModel:
             print(f"    thinks {belief.probability:.0%} (market: {price:.0%}, edge: {edge:+.1f}%) conf={belief.confidence:.0%}", flush=True)
             print(f"    reason: {belief.reasoning[:80]}", flush=True)
 
+            # Push to ring buffer for dashboard
+            self._thought_buffer.append({
+                "ts": time.time(),
+                "agent": belief.agent_name,
+                "market_id": belief.market_id,
+                "question": market_q,
+                "probability": float(belief.probability),
+                "market_price": float(price),
+                "edge": float(edge),
+                "confidence": float(belief.confidence),
+                "reasoning": belief.reasoning[:120],
+                "surprise": False,
+            })
+
             # Surprise detection with narration
             if old_consensus is not None:
                 shift = abs(belief.probability - old_consensus)
@@ -239,13 +277,8 @@ class WorldModel:
                     self._surprises.append(SurpriseEvent(market_id=belief.market_id, old_consensus=old_consensus, new_belief=belief.probability, shift_magnitude=shift, agent=belief.agent_name, reasoning=belief.reasoning))
                     self._surprises = self._surprises[-50:]
                     print(f"    *** SURPRISE: shifted consensus by {shift:.0%} ***", flush=True)
-                    # Fire surprise event callbacks
-                    for cb in self._event_callbacks.get("surprise", []):
-                        try:
-                            cb(belief.market_id, old_consensus, belief.probability,
-                               belief.agent_name, market_q)
-                        except Exception:
-                            pass
+                    if self._thought_buffer:
+                        self._thought_buffer[-1]["surprise"] = True
 
             new_consensus, new_conf, contributors = self._get_consensus_unlocked(belief.market_id)
             if new_consensus is not None:
@@ -563,6 +596,7 @@ class WorldModel:
                     cb(impact)
                 except Exception:
                     pass
+        self._record_news(impact)
 
     def get_recent_news(self, max_age_sec=3600):
         cutoff = time.time() - max_age_sec
@@ -604,6 +638,7 @@ class WorldModel:
                 cb(market_id, price, question=question)
             except Exception:
                 pass
+        self._record_market(market_id, price, volume=volume, category=category, question=question)
 
     def get_market_price(self, market_id):
         with self._lock:
