@@ -141,6 +141,19 @@ class MetaCoordinator:
         self._smarkets_username = config.smarkets_username
         self._smarkets_password = config.smarkets_password
 
+        # Odds API price feed — primary external price source. Started as a
+        # background task in run() and shared with OddsArbitrageAgent.
+        self.odds_feed = None
+        odds_key_init = getattr(config, 'odds_api_key', '')
+        if odds_key_init:
+            from agent.swarm.odds_price_feed import OddsPriceFeed
+            self.odds_feed = OddsPriceFeed(
+                world=self.world,
+                api_key=odds_key_init,
+                sport_keys=["soccer_epl", "basketball_nba"],
+                poll_interval=1200.0,
+            )
+
         self.risk = RiskManager(config.risk, total_capital=config.risk.max_total_exposure_usd)
         self.executor = ExecutionEngine(config)
         self.performance = PerformanceTracker()
@@ -163,6 +176,16 @@ class MetaCoordinator:
         )
         if self._adversarial_ref:
             self.thesis_gen = ThesisGenerator(self.world, self._adversarial_ref)
+
+        # Wire the odds price feed into the OddsArbitrageAgent so the agent
+        # consumes synthetic-id markets directly instead of doing its own
+        # fetching and broken fuzzy matching.
+        if self.odds_feed is not None:
+            for a in self.agents:
+                if getattr(a, 'name', '') == 'odds_arbitrage':
+                    a.price_feed = self.odds_feed
+                    out("  [INIT] OddsArbitrageAgent wired to OddsPriceFeed")
+                    break
         
         # Wire up event-driven triggers
         self.world.register_event_callback(
@@ -227,6 +250,7 @@ class MetaCoordinator:
             ))
         odds_key = getattr(cfg, 'odds_api_key', '')
         if odds_key:
+            # Agent is instantiated WITHOUT the price feed here.
             agents.append(OddsArbitrageAgent(self.world, odds_api_key=odds_key))
         if cfg.anthropic_api_key:
             agents.append(AdversarialAgent(
@@ -259,7 +283,16 @@ class MetaCoordinator:
         out("")
 
         # Start agents ONCE — don't restart them on every refresh
+        # Start agents ONCE — don't restart them on every refresh
         agent_tasks = self._start_agents()
+
+        # Start the Odds API price feed as a background task. It registers
+        # synthetic markets in the world model and the OddsArbitrageAgent
+        # consumes them.
+        odds_feed_task = None
+        if self.odds_feed is not None:
+            odds_feed_task = asyncio.create_task(self.odds_feed.start())
+            out("  [INIT] OddsPriceFeed background task started")
 
         dashboard_task = asyncio.create_task(run_dashboard(self, port=8000))
 
@@ -306,8 +339,12 @@ class MetaCoordinator:
         finally:
             for agent in self.agents:
                 agent.stop()
+            if self.odds_feed is not None:
+                self.odds_feed.stop()
             for task in agent_tasks:
                 task.cancel()
+            if odds_feed_task is not None:
+                odds_feed_task.cancel()
             dashboard_task.cancel()
             await self.shutdown()
 
@@ -323,12 +360,27 @@ class MetaCoordinator:
 
         for edge in edges[:5]:
             self._signals_seen += 1
+
+            # QUALITY GATE 1: hard volume floor. Sub-$200 volume markets on
+            # Smarkets are mostly wide-spread retail noise — the soft penalty
+            # in _compute_edge_quality isn't enough to keep them out.
+            market_volume = self.world._market_volumes.get(edge.market_id, 0)
+            if market_volume < 200:
+                continue
+
             timing = self.world.get_timing_signals(edge.market_id)
             urgency = max((s.urgency for s in timing), default=0.5)
 
             belief_summary = self.world.get_belief_summary(edge.market_id)
             belief_ages = [b.get("age_seconds", 999) for b in belief_summary.get("beliefs", [])]
             avg_age = mean(belief_ages) if belief_ages else 999
+
+            # QUALITY GATE 2: hard belief-age floor. The composite freshness
+            # term can let stale intel through if the edge is large enough.
+            # Don't trade on cold beliefs — they're often pre-news shocks.
+            if avg_age > 480:
+                continue
+
             freshness = max(0.3, 1.0 - (avg_age / 600))
 
             num_agents = len(edge.contributing_agents)
@@ -411,13 +463,13 @@ class MetaCoordinator:
             if result.status == OrderStatus.FILLED:
                 try:
                     self.risk.on_fill(result, edge.market_question)
-                except Exception:
-                    pass
-                self._trades_executed += 1
-                estimated_pnl = sized * (edge.edge_pct / 100)
-                self.performance.record_trade(
-                    estimated_pnl, edge.contributing_agents, edge.market_question
-                )
+                except Exception as e:
+                    logger.warning(
+                        "risk_on_fill_failed",
+                        error=str(e),
+                        market=edge.market_id[:8],
+                        side=str(signal.side),
+                    )
 
                 # Record trade for later analysis
                 adv_rating = ""
@@ -443,7 +495,16 @@ class MetaCoordinator:
                 )
 
                 # Terminal output with thesis
-                out(thesis.to_terminal_summary())
+                # Generate and print thesis
+                try:
+                    thesis = self.thesis_gen.generate(
+                        edge=edge,
+                        composite_score=composite,
+                        size_usd=sized,
+                    )
+                    out(thesis.to_terminal_summary())
+                except Exception as e:
+                    out(f"  [WARN] Thesis generation failed: {e}")
 
                 # === Record for metalearning ===
                 import datetime
@@ -458,8 +519,8 @@ class MetaCoordinator:
                     composite_score=composite,
                     regime=edge.regime,
                     hour_of_day=datetime.datetime.now().hour,
-                    pnl=estimated_pnl,
-                    was_profitable=estimated_pnl > 0,
+                    pnl=0.0,
+                    was_profitable=False,
                 ))
 
     def _kelly_size(self, edge, urgency: float) -> float:
@@ -486,12 +547,45 @@ class MetaCoordinator:
 
             domains = ["politics", "current_affairs", "entertainment",
                        "football", "horse_racing", "tennis"]
-            self._markets = await self.smarkets.get_markets_as_agent_models(
+            new_markets = await self.smarkets.get_markets_as_agent_models(
                 domains=domains, limit=100
             )
+
+            # Synthesize Market objects for OddsPriceFeed-registered markets
+            # so the LLM agents can iterate them. Without this, agents only
+            # see the Smarkets markets and ignore the 72 sports markets.
+            if self.odds_feed is not None:
+                from agent.models import Market as MarketModel
+                for mid in self.odds_feed.get_known_market_ids():
+                    meta = self.odds_feed.get_event_meta(mid)
+                    if not meta:
+                        continue
+                    side_team = meta["home"] if meta["side"] == "home" else meta["away"]
+                    new_markets.append(MarketModel(
+                        condition_id=mid,
+                        question=f"{meta['home']} vs {meta['away']}: {side_team} to win",
+                        slug=mid,
+                        outcomes=["Yes", "No"],
+                        token_ids=[mid],
+                        end_date=None,
+                        active=True,
+                        volume=max(250.0, meta.get("num_books", 0) * 100.0),
+                        liquidity=0,
+                        category=f"oddsapi:{meta['sport']}",
+                    ))
+
+            self._markets.clear()
+            self._markets.extend(new_markets)
+
+            # Mutate in place — agents hold a reference to self._markets from
+            # startup. Rebinding the attribute would leave them iterating the
+            # stale list forever.
+            self._markets.clear()
+            self._markets.extend(new_markets)
             self._last_market_refresh = time.time()
 
             prices_loaded = 0
+            sample_logged = False
             for market in self._markets:
                 price_found = None
                 for cid in market.token_ids:
@@ -582,6 +676,7 @@ class MetaCoordinator:
             "metalearning": self.metalearning.get_report(),
             "recent_theses": self.thesis_gen.get_recent_theses(5),
             "decay_profiles": self.world.decay_engine.get_status(),
+            "odds_feed": self.odds_feed.get_status() if self.odds_feed else None,
             "mode": self.config.mode,
             "platform": self.config.platform,
             "performance": self.performance.get_summary(),

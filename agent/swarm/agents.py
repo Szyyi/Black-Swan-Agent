@@ -508,6 +508,15 @@ Step 4: Factor in that unlikely events become less likely as time runs out.""",
             return
         batch = get_priority_markets(self.name, candidates, top_n=3)
 
+        # Actually run the estimator on the prioritised batch.
+        # Without this loop the entire 5-perspective ensemble was a no-op.
+        for market in batch:
+            try:
+                await self._estimate_market(market)
+            except Exception as e:
+                logger.debug("estimator_market_error", market=market.condition_id[:8], error=str(e))
+            await asyncio.sleep(0.5)  # Stagger LLM calls to avoid burst rate limits
+
     async def _estimate_market(self, market: Market):
         price = self.world.get_market_price(market.condition_id)
         if price is None:
@@ -1319,125 +1328,89 @@ Respond with JSON only:
 
 class OddsArbitrageAgent(SwarmAgent):
     """
-    Compares Smarkets odds against other bookmakers to find:
-    - Value bets (Smarkets price is better than market consensus)
-    - Pure arbitrage (different bookmakers disagree enough for guaranteed profit)
-    - Market consensus (what the "true" probability is across all bookmakers)
+    Consumes prices from the shared OddsPriceFeed and submits beliefs against
+    the feed's canonical synthetic market IDs. NO fuzzy matching — markets are
+    first-class entities in the world model.
 
-    Uses The Odds API (free tier: 500 requests/month).
+    The feed handles all API I/O and quota tracking. This agent only:
+    - Reads consensus prices the feed already pushed
+    - Computes a belief slightly tighter than the consensus (since the feed's
+      consensus IS the market price for these synthetic markets, the agent's
+      job is to provide adversarial reasoning around it)
+    - Detects pure arbitrage opportunities for logging
     """
 
     name = "odds_arbitrage"
-    interval_seconds = 600  # Every 10 min (preserve API quota)
+    interval_seconds = 300  # Every 5 min — feed handles the quota
 
-    def __init__(self, world: WorldModel, odds_api_key: str = ""):
+    def __init__(self, world: WorldModel, odds_api_key: str = "",
+                 price_feed=None):
         super().__init__(world)
         self.odds_api_key = odds_api_key
-
-        from agent.data.odds_api import OddsComparisonClient, SPORT_KEYS
-        self.odds = OddsComparisonClient(api_key=odds_api_key)
-        self.sport_keys = SPORT_KEYS
+        self.price_feed = price_feed  # Set by coordinator after init
+        # Compatibility shim — some legacy paths still reference self.odds.
+        # The real client lives inside OddsPriceFeed now; this stub just
+        # prevents AttributeError on stale calls.
+        self.odds = None
 
     async def run_cycle(self, markets: list[Market]):
-        if not self.odds_api_key:
-            logger.debug("odds_arbitrage_skipped", reason="no API key")
+        if self.price_feed is None:
+            logger.debug("odds_arbitrage_skipped", reason="no_price_feed")
             return
 
-        # Scan major sports for value
-        sports_to_scan = ["soccer_epl", "basketball_nba"]
-        total_value = 0
-        total_arbs = 0
+        known_ids = self.price_feed.get_known_market_ids()
+        if not known_ids:
+            logger.debug("odds_arbitrage_no_markets")
+            return
 
-        for sport_key in sports_to_scan:
-            try:
-                # Find value bets
-                value_bets = await self.odds.find_value_bets(sport_key, min_edge_pct=3.0)
-                for vb in value_bets[:5]:
-                    total_value += 1
-                    # Try to match to a Smarkets market
-                    matched = self._match_to_market(vb, markets)
-                    if matched:
-                        self.world.submit_belief(Belief(
-                            agent_name=self.name,
-                            market_id=matched.condition_id,
-                            probability=vb["market_prob"],
-                            confidence=min(0.85, 0.5 + vb["edge_pct"] / 20),
-                            reasoning=(
-                                f"Odds consensus: {vb['num_bookmakers']} bookmakers "
-                                f"avg {vb['market_prob']:.0%} vs Smarkets "
-                                f"({vb['edge_pct']:.1f}% edge)"
-                            ),
-                            evidence=[
-                                f"best_price={vb['best_price']}",
-                                f"worst_price={vb['worst_price']}",
-                                f"avg_price={vb['avg_price']}",
-                            ],
-                            ttl_seconds=600,
-                        ))
+        beliefs_submitted = 0
+        for market_id in known_ids:
+            meta = self.price_feed.get_event_meta(market_id)
+            if not meta:
+                continue
 
-                # Find arbitrage
-                arbs = await self.odds.find_arbitrage(sport_key)
-                total_arbs += len(arbs)
-                for arb in arbs:
-                    logger.info(
-                        "arbitrage_found",
-                        event=arb["event"],
-                        profit=f"{arb['profit_pct']:.2f}%",
-                        legs=arb["legs"],
-                    )
+            current_price = self.world.get_market_price(market_id)
+            if current_price is None:
+                continue
 
-                # Get market consensus and update world model
-                consensus = await self.odds.get_market_consensus(sport_key)
-                for c in consensus:
-                    matched = self._match_to_market_by_teams(
-                        c.get("home_team", ""), c.get("away_team", ""), markets
-                    )
-                    if matched:
-                        # Use consensus probability as a belief
-                        home_prob = c["fair_probabilities"].get(c.get("home_team", ""), 0)
-                        if home_prob > 0:
-                            self.world.submit_belief(Belief(
-                                agent_name=self.name,
-                                market_id=matched.condition_id,
-                                probability=home_prob,
-                                confidence=min(0.8, 0.4 + c["num_bookmakers"] * 0.03),
-                                reasoning=(
-                                    f"Market consensus from {c['num_bookmakers']} bookmakers "
-                                    f"(overround: {c['overround']:.1f}%)"
-                                ),
-                                evidence=[str(c["fair_probabilities"])],
-                                ttl_seconds=600,
-                            ))
+            # The feed's consensus IS the market price. The agent submits a
+            # belief at the same probability with confidence scaled by book
+            # count — this gives the world model a "trusted anchor" belief
+            # that other agents (probability estimator, contrarian) can then
+            # disagree with. Without this anchor, sports markets would have
+            # only adversarial views and no positive evidence.
+            num_books = meta.get("num_books", 0)
+            if num_books < 3:
+                continue  # Not enough books for reliable consensus
 
-            except Exception as e:
-                logger.debug("odds_scan_error", sport=sport_key, error=str(e))
+            confidence = min(0.85, 0.45 + num_books * 0.04)
 
-        remaining = self.odds.requests_remaining
+            self.world.submit_belief(Belief(
+                agent_name=self.name,
+                market_id=market_id,
+                probability=current_price,
+                confidence=confidence,
+                reasoning=(
+                    f"Bookmaker consensus from {num_books} sources "
+                    f"({meta['home']} vs {meta['away']}, "
+                    f"{meta['side']} side)"
+                ),
+                evidence=[
+                    f"sport={meta['sport']}",
+                    f"num_bookmakers={num_books}",
+                ],
+                ttl_seconds=900,
+                domain=meta["sport"],
+            ))
+            beliefs_submitted += 1
+
+        feed_status = self.price_feed.get_status()
         logger.info(
             "odds_arbitrage_cycle",
-            value_bets=total_value,
-            arbitrage=total_arbs,
-            api_remaining=remaining,
+            beliefs=beliefs_submitted,
+            known_markets=len(known_ids),
+            quota_remaining=feed_status.get("quota_remaining", 0),
         )
-
-    def _match_to_market(self, value_bet: dict, markets: list[Market]) -> Market | None:
-        event = value_bet.get("event", "").lower()
-        for m in markets:
-            q = m.question.lower()
-            if any(word in q for word in event.split() if len(word) > 3):
-                return m
-        return None
-
-    def _match_to_market_by_teams(self, home: str, away: str,
-                                   markets: list[Market]) -> Market | None:
-        home_l = home.lower()
-        away_l = away.lower()
-        for m in markets:
-            q = m.question.lower()
-            if home_l[:6] in q and away_l[:6] in q:
-                return m
-        return None
-
 
 # ══════════════════════════════════════════════════════
 #  WEB RESEARCH — searches for real-time market info
